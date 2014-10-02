@@ -39,11 +39,13 @@ import java.util.{List => JavaList}
 import java.util.Properties
 
 import scala.collection.JavaConverters._
-import scala.collection.mutable.MutableList
 import scala.collection.mutable.{Map => MutableMap}
+import scala.collection.mutable.MutableList
 import scala.reflect.ClassTag
 import scala.util.{Try, Success, Failure}
 
+import org.apache.spark.Accumulable
+import org.apache.spark.AccumulableParam
 import org.apache.spark.SparkContext
 import org.apache.spark.SparkContext._
 import org.apache.spark.rdd.RDD
@@ -54,14 +56,10 @@ import com.oculusinfo.binning.TileIndex
 import com.oculusinfo.binning.TilePyramid
 import com.oculusinfo.binning.io.PyramidIO
 import com.oculusinfo.binning.io.serialization.TileSerializer
-import com.oculusinfo.binning.io.serialization.impl.DoubleAvroSerializer
 import com.oculusinfo.binning.metadata.PyramidMetaData
-import com.oculusinfo.binning.util.Pair
 
 import com.oculusinfo.tilegen.datasets.Dataset
 import com.oculusinfo.tilegen.datasets.DatasetFactory
-import com.oculusinfo.tilegen.tiling.RDDBinner
-import com.oculusinfo.tilegen.util.Rectangle
 
 
 
@@ -69,16 +67,9 @@ import com.oculusinfo.tilegen.util.Rectangle
 /**
  * This class reads and caches a data set for live queries of its tiles
  */
-class LiveStaticTilePyramidIO (sc: SparkContext) extends PyramidIO {
+class LiveStaticTilePyramidIO2 (sc: SparkContext) extends PyramidIO {
 	private val datasets = MutableMap[String, Dataset[_, _, _, _, _]]()
 	private val metaData = MutableMap[String, PyramidMetaData]()
-	private var consolidationPartitions: Option[Int] = Some(1)
-	def eliminateConsolidationPartitions: Unit =
-		consolidationPartitions = None
-	def setConsolidationPartitions (partitions: Int): Unit =
-		consolidationPartitions = Some(partitions)
-	def getConsolidationPartitions = consolidationPartitions
-
 
 	def initializeForWrite (pyramidId: String): Unit = {
 	}
@@ -107,130 +98,133 @@ class LiveStaticTilePyramidIO (sc: SparkContext) extends PyramidIO {
 		}
 	}
 
-	/*
-	 * Convert a set of tiles to testable bounds.
-	 *
-	 * The returned bounds are in two potential forms, paired into a 2-tuble.
-	 *
-	 * The first element is the bounds, in tile indices.
-	 */
-	private def tilesToBounds (pyramid: TilePyramid,
-	                           tiles: Iterable[TileIndex]): Bounds = {
-		var mutableRows = MutableList[Bounds]()
-		val bounds = tiles.map(tile =>
-			((tile.getX, tile.getY()),
-			 new Bounds(tile.getLevel(),
-			            new Rectangle[Int](tile.getX(), tile.getX(),
-			                               tile.getY(), tile.getY()),
-			            None))
-		).toSeq.sortBy(_._1).map(_._2).foreach(bounds =>
-			{
-				if (mutableRows.isEmpty) {
-					mutableRows += bounds
-				} else {
-					val last = mutableRows.last
-					val combination = last union bounds
-					if (combination.isEmpty) {
-						mutableRows += bounds
-					} else {
-						mutableRows(mutableRows.size-1) = combination.get
-					}
-				}
-			}
-		)
-
-		val rows = mutableRows.foldRight(None: Option[Bounds])((bounds, rest) =>
-			Some(new Bounds(bounds.level, bounds.indexBounds, rest))
-		).getOrElse(null)
-
-		if (null == rows) {
-			null
-		} else {
-			// reduce returns None if no reduction is required
-			rows.reduce.getOrElse(rows)
-		}
-	}
-
 	def readTiles[BT] (pyramidId: String,
 	                   serializer: TileSerializer[BT],
 	                   javaTiles: JavaIterable[TileIndex]):
 			JavaList[TileData[BT]] = {
-		def inner[IT: ClassTag, PT: ClassTag, DT: ClassTag, AT: ClassTag]: JavaList[TileData[BT]] = {
-			val tiles: Iterable[TileIndex] = javaTiles.asScala
+		// Note that all tiles given _must_ have the same dimensions.
 
-			if (!datasets.contains(pyramidId) ||
-				    tiles.isEmpty) {
-				null
-			} else {
+		if (!datasets.contains(pyramidId) || null == javaTiles || javaTiles.iterator.hasNext) {
+			null
+		} else {
+
+			def inner[IT: ClassTag, PT: ClassTag, DT: ClassTag, AT: ClassTag]:
+					JavaList[TileData[BT]] = {
 				val dataset = datasets(pyramidId).asInstanceOf[Dataset[IT, PT, DT, AT, BT]]
+				val analytic = dataset.getBinningAnalytic
+				val tiles = javaTiles.asScala.toArray
+				val xBins = tiles(0).getXBins
+				val yBins = tiles(0).getYBins
+
+
+				def updateMetaData (pyramidId: String, tiles: Iterable[TileData[BT]]) = {
+					// Update metadata for these levels
+					val datasetMetaData = getMetaData(pyramidId).get
+
+					val newDatasetMetaData =
+						new PyramidMetaData(datasetMetaData.getName(),
+						                    datasetMetaData.getDescription(),
+						                    datasetMetaData.getTileSizeX(),
+						                    datasetMetaData.getTileSizeY(),
+						                    datasetMetaData.getScheme(),
+						                    datasetMetaData.getProjection(),
+						                    datasetMetaData.getValidZoomLevels(),
+						                    datasetMetaData.getBounds(),
+						                    null, null)
+					dataset.getTileAnalytics.map(_.applyTo(newDatasetMetaData))
+					dataset.getDataAnalytics.map(_.applyTo(newDatasetMetaData))
+					newDatasetMetaData.addValidZoomLevels(
+						tiles.map(tile =>
+							new JavaInt(tile.getDefinition().getLevel())
+						).toSet.asJava
+					)
+
+					metaData(pyramidId) = newDatasetMetaData
+				}
+
+
+
+				// Get a map from tile level to a list of tiles on that level, with associated
+				// accumulables.
+				val tileData = {
+					val mutableTileData =
+						MutableMap[Int,
+						           MutableMap[TileIndex,
+						                      Accumulable[MutableMap[BinIndex, PT],
+						                                  (BinIndex, PT)]]]()
+					tiles.foreach(tile =>
+						{
+							val level = tile.getLevel
+							val initialParam = MutableMap[BinIndex, PT]()
+							val param = new TileAccumulableParam(tile.getXBins, tile.getYBins,
+							                                     analytic.aggregate)
+							val accumulable = sc.accumulable(initialParam)(param)
+							if (mutableTileData.contains(level)) {
+								mutableTileData(level)(tile) = accumulable
+							} else {
+								mutableTileData(level) = MutableMap(tile -> accumulable)
+							}
+						}
+					)
+					mutableTileData.map{case (level, levelMap) => (level, levelMap.toMap)}.toMap
+				}
+
+				// Run over data set, looking for points in those tiles at those levels
 				val indexScheme = dataset.getIndexScheme
-				val binningAnalytic = dataset.getBinningAnalytic
 				val pyramid = dataset.getTilePyramid
+				val identity: RDD[(IT, PT, Option[DT])] => RDD[(IT, PT, Option[DT])] =
+					rdd => rdd
+				dataset.transformRDD(identity).foreach{case (index, value, analyticValue) =>
+						{
+							val (x, y) = indexScheme.toCartesian(index)
+							tileData.foreach{case (level, tileInfos) =>
+								{
+									val tile = pyramid.rootToTile(x, y, level, xBins, yBins)
+									if (tileInfos.contains(tile)) {
+										val bin = pyramid.rootToBin(x, y, tile)
+										tileInfos(tile) += (bin, value)
+									}
+								}
+							}
+						}
+				}
 
-				val xBins = tiles.head.getXBins()
-				val yBins = tiles.head.getXBins()
-				val bounds = tilesToBounds(pyramid, tiles)
+				val results = tileData.flatMap(_._2).map{case (index, data) =>
+					{
+						val tile = new TileData[BT](index)
 
-				val boundsTest = bounds.getSerializableContainmentTest(pyramid, xBins, yBins)
-				val cartesianSpreaderFcn = bounds.getSpreaderFunction[PT](pyramid, xBins, yBins)
-				val spreaderFcn: IT => TraversableOnce[(TileIndex, BinIndex)] =
-					index => {
-						val cartesianIndex = indexScheme.toCartesian(index)
+						// Put the proper default in all bins
+						val defaultBinValue =
+							analytic.finish(analytic.defaultProcessedValue)
+						for (x <- 0 until xBins) {
+							for (y <- 0 until yBins) {
+								tile.setBin(x, y, defaultBinValue)
+							}
+						}
 
-						val spread = cartesianSpreaderFcn(cartesianIndex._1, cartesianIndex._2)
-						spread
+						// Put the proper value into each bin
+						data.value.foreach{case (bin, value) =>
+							tile.setBin(bin.getX, bin.getY, analytic.finish(value))
+						}
+
+						tile
 					}
+				}.toSeq
 
-				val binner = new RDDBinner
-				binner.debug = true
+				updateMetaData(pyramidId, results)
 
-				val results: Array[TileData[BT]] = dataset.transformRDD[TileData[BT]](
-					rdd => {
-						binner.processData[IT, PT, AT, DT, BT](rdd,
-						                                       binningAnalytic,
-						                                       dataset.getTileAnalytics,
-						                                       dataset.getDataAnalytics,
-						                                       spreaderFcn,
-						                                       consolidationPartitions)
-					}
-				).collect
-
-				// Update metadata for these levels
-				val datasetMetaData = getMetaData(pyramidId).get
-
-				val newDatasetMetaData =
-					new PyramidMetaData(datasetMetaData.getName(),
-					                    datasetMetaData.getDescription(),
-					                    datasetMetaData.getTileSizeX(),
-					                    datasetMetaData.getTileSizeY(),
-					                    datasetMetaData.getScheme(),
-					                    datasetMetaData.getProjection(),
-					                    datasetMetaData.getValidZoomLevels(),
-					                    datasetMetaData.getBounds(),
-					                    null, null)
-				dataset.getTileAnalytics.map(_.applyTo(newDatasetMetaData))
-				dataset.getDataAnalytics.map(_.applyTo(newDatasetMetaData))
-				newDatasetMetaData.addValidZoomLevels(
-					results.map(tile =>
-						new JavaInt(tile.getDefinition().getLevel())
-					).toSet.asJava
-				)
-
-				metaData(pyramidId) = newDatasetMetaData
-
-				// Finally, return our tiles
-				results.toList.asJava
+				results.asJava
 			}
-		}
 
-		inner
+			inner
+		}
 	}
 
+
 	def getTileStream[BT] (pyramidId: String, serializer: TileSerializer[BT],
-	                      tile: TileIndex): InputStream = {
+	                       tile: TileIndex): InputStream = {
 		val results: JavaList[TileData[BT]] =
 			readTiles(pyramidId, serializer, List[TileIndex](tile).asJava)
-
 		if (null == results || 0 == results.size || null == results.get(0)) {
 			null
 		} else {
@@ -254,5 +248,28 @@ class LiveStaticTilePyramidIO (sc: SparkContext) extends PyramidIO {
 
 	def removeTiles (id: String, tiles: JavaIterable[TileIndex]  ) : Unit =
 		throw new IOException("removeTiles not currently supported for LiveStaticTilePyramidIO")
-	
+}
+
+
+class TileAccumulableParam[T] (width: Int, height: Int, add: (T, T) => T)
+		extends AccumulableParam[MutableMap[BinIndex, T], (BinIndex, T)]
+{
+	def addAccumulator (r: MutableMap[BinIndex, T], t: (BinIndex, T)):
+			MutableMap[BinIndex, T] = {
+		val (index, value) = t
+		r(index) = r.get(index).map(valueR => add(valueR, value)).getOrElse(value)
+		r
+	}
+
+	def addInPlace (r1: MutableMap[BinIndex, T], r2: MutableMap[BinIndex, T]):
+			MutableMap[BinIndex, T] = {
+		r2.foreach{case (index, value2) =>
+			{
+				r1(index) = r1.get(index).map(value1 => add(value1, value2)).getOrElse(value2)
+			}
+		}
+		r1
+	}
+	def zero (initialValue: MutableMap[BinIndex, T]): MutableMap[BinIndex, T] =
+		MutableMap[BinIndex, T]()
 }
