@@ -100,6 +100,14 @@ object TileIO {
 				                    "The path to the sqlite database",
 				                    Some(""))
 			)
+			case "hdfs" => new SequenceFileTileIO(
+				argParser.getString(Array("base", "oculus.tileio.hdfs.baselocation"),
+				                    "The base location at which to put and find HDFS files.  "+
+					                    "Typically something like 'hdfs://hdfs-machine', but "+
+					                    "can include a port, or even a base directory in "+
+					                    "which to locate tile sets.",
+				                    None)
+			)
 			case _ => new LocalTileIO(
 				argParser.getString(Array("tileextension", "oculus.tileio.file.extension"),
 				                    "The extension used for each tile file.  Default is "+
