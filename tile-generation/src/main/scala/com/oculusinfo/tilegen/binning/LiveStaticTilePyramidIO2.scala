@@ -37,11 +37,15 @@ import java.lang.{Iterable => JavaIterable}
 import java.lang.{Integer => JavaInt}
 import java.util.{List => JavaList}
 import java.util.Properties
+
 import scala.collection.JavaConverters._
 import scala.collection.mutable.{Map => MutableMap}
 import scala.collection.mutable.MutableList
+import scala.collection.mutable.{Set => MutableSet}
+import scala.collection.mutable.Stack
 import scala.reflect.ClassTag
 import scala.util.{Try, Success, Failure}
+
 import org.apache.spark.Accumulable
 import org.apache.spark.AccumulableParam
 import org.apache.spark.SparkContext
@@ -67,6 +71,7 @@ import org.apache.log4j.Level
 class LiveStaticTilePyramidIO2 (sc: SparkContext) extends PyramidIO {
 	private val datasets = MutableMap[String, Dataset[_, _, _, _, _]]()
 	private val metaData = MutableMap[String, PyramidMetaData]()
+	private val accStore = new AccumulatorStore
 
 	def initializeForWrite (pyramidId: String): Unit = {
 	}
@@ -128,18 +133,14 @@ class LiveStaticTilePyramidIO2 (sc: SparkContext) extends PyramidIO {
         // accumulables.
         val levels = tiles.map(_.getLevel).toSet
         val add: (PT, PT) => PT = analytic.aggregate
-		val p1 = new TileAccumulableParam(xBins, yBins, add)
-		val acc = sc.accumulable(MutableMap[BinIndex, PT]())(p1)
-        val tileData = levels.map(level =>
-            {
-                val param = new TileAccumulableParam(xBins, yBins, add)
-                (level,
-                 tiles.filter(tile => level == tile.getLevel).map(tile =>
-                     (tile, sc.accumulable(MutableMap[BinIndex, PT]())(param))
-                 ).toMap
-                )
-            }
-        ).toMap
+
+		val tileData = levels.map(level =>
+			(level,
+			 tiles.filter(tile => level == tile.getLevel).map(tile =>
+				 (tile -> accStore.reserve(sc, add, xBins, yBins))
+			 ).toMap
+			)
+		).toMap
 
         // Run over data set, looking for points in those tiles at those levels
         val indexScheme = dataset.getIndexScheme
@@ -155,7 +156,7 @@ class LiveStaticTilePyramidIO2 (sc: SparkContext) extends PyramidIO {
                         val tile = pyramid.rootToTile(x, y, level, xBins, yBins)
                         if (tileInfos.contains(tile)) {
                             val bin = pyramid.rootToBin(x, y, tile)
-                            tileInfos(tile) += (bin, value)
+                            tileInfos(tile).accumulable += (bin, value)
                         }
                     }
                 }
@@ -163,9 +164,9 @@ class LiveStaticTilePyramidIO2 (sc: SparkContext) extends PyramidIO {
         }
 
 		// We've got aggregates of each tile's data; convert to tiles.
-		tileData.flatMap(_._2).flatMap{case (index, data) =>
+		val results = tileData.flatMap(_._2).flatMap{case (index, data) =>
             {
-	            if (data.value.isEmpty) {
+	            if (data.accumulable.value.isEmpty) {
 		            Seq[TileData[BT]]()
 	            } else {
 		            val tile = new TileData[BT](index)
@@ -180,14 +181,21 @@ class LiveStaticTilePyramidIO2 (sc: SparkContext) extends PyramidIO {
 		            }
 
 		            // Put the proper value into each bin
-		            data.value.foreach{case (bin, value) =>
+		            data.accumulable.value.foreach{case (bin, value) =>
 			            tile.setBin(bin.getX, bin.getY, analytic.finish(value))
 		            }
 
 		            Seq[TileData[BT]](tile)
 	            }
             }
-        }.toSeq
+		}.toSeq
+
+		// Free up the accumulables we've used
+		tileData.flatMap(_._2).foreach{case (index, data) =>
+			accStore.release(data)
+		}
+
+		results
     }
 
 	def updateMetaData[BT] (pyramidId: String, tiles: Iterable[TileData[BT]]) = {
@@ -248,18 +256,30 @@ class LiveStaticTilePyramidIO2 (sc: SparkContext) extends PyramidIO {
 }
 
 
-class TileAccumulableParam[T] (width: Int, height: Int, add: (T, T) => T)
-		extends AccumulableParam[MutableMap[BinIndex, T], (BinIndex, T)]
+case class TileAccumulableInfo[PT: ClassTag] (
+	accumulable: Accumulable[MutableMap[BinIndex, PT], (BinIndex, PT)],
+	param: TileAccumulableParam[PT]
+) {}
+
+class TileAccumulableParam[PT] (private var width: Int,
+                                private var height: Int,
+                                private var add: (PT, PT) => PT)
+		extends AccumulableParam[MutableMap[BinIndex, PT], (BinIndex, PT)]
 {
-	def addAccumulator (r: MutableMap[BinIndex, T], t: (BinIndex, T)):
-			MutableMap[BinIndex, T] = {
+  def reset (w: Int, h: Int, a: (PT, PT) => PT): Unit = {
+    width = w
+    height = h
+    add = a
+  }
+	def addAccumulator (r: MutableMap[BinIndex, PT], t: (BinIndex, PT)):
+			MutableMap[BinIndex, PT] = {
 		val (index, value) = t
 		r(index) = r.get(index).map(valueR => add(valueR, value)).getOrElse(value)
 		r
 	}
 
-	def addInPlace (r1: MutableMap[BinIndex, T], r2: MutableMap[BinIndex, T]):
-			MutableMap[BinIndex, T] = {
+	def addInPlace (r1: MutableMap[BinIndex, PT], r2: MutableMap[BinIndex, PT]):
+			MutableMap[BinIndex, PT] = {
 		r2.foreach{case (index, value2) =>
 			{
 				r1(index) = r1.get(index).map(value1 => add(value1, value2)).getOrElse(value2)
@@ -267,6 +287,49 @@ class TileAccumulableParam[T] (width: Int, height: Int, add: (T, T) => T)
 		}
 		r1
 	}
-	def zero (initialValue: MutableMap[BinIndex, T]): MutableMap[BinIndex, T] =
-		MutableMap[BinIndex, T]()
+	def zero (initialValue: MutableMap[BinIndex, PT]): MutableMap[BinIndex, PT] =
+		MutableMap[BinIndex, PT]()
+}
+
+class AccumulatorStore {
+	// Make sure functions only work on the client thread that created the store
+	private val origin = Thread.currentThread
+	private val inUse = MutableMap[ClassTag[_], MutableSet[TileAccumulableInfo[_]]]()
+	private val available = MutableMap[ClassTag[_], Stack[TileAccumulableInfo[_]]]()
+
+	def reserve[PT] (sc: SparkContext,
+	                 add: (PT, PT) => PT,
+	                 xBins: Int,
+	                 yBins: Int)(implicit evidence: ClassTag[PT]): TileAccumulableInfo[PT] = {
+		val info: TileAccumulableInfo[PT] =
+			available.synchronized {
+				if (!available.contains(evidence) || available(evidence).isEmpty) {
+					// None available, create a new one.
+					val param = new TileAccumulableParam[PT](xBins, yBins, add)
+					val accum = sc.accumulable(MutableMap[BinIndex, PT]())(param)
+					new TileAccumulableInfo[PT](accum, param)(evidence)
+				} else {
+					val reusable = available(evidence).pop.asInstanceOf[TileAccumulableInfo[PT]]
+					reusable.param.reset(xBins, yBins, add)
+					reusable
+				}
+			}
+		inUse.synchronized {
+			if (!inUse.contains(evidence)) {
+				inUse(evidence) = MutableSet[TileAccumulableInfo[_]]()
+			}
+		}
+		inUse(evidence) += info
+		info
+	}
+	def release[PT] (info: TileAccumulableInfo[PT])(implicit evidence: ClassTag[PT]): Unit = {
+		inUse(evidence) -= info
+		info.accumulable.setValue(info.param.zero(info.accumulable.value))
+		available.synchronized {
+			if (!available.contains(evidence)) {
+				available(evidence) = Stack[TileAccumulableInfo[_]]()
+			}
+		}
+		available(evidence).push(info)
+	}
 }
