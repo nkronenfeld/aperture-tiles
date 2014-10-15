@@ -198,6 +198,12 @@ class LiveStaticTilePyramidIO2 (sc: SparkContext) extends PyramidIO {
 			accStore.release(data)
 		}
 
+		println("Read "+results.size+" tiles.")
+		println("\t"+accStore.inUseCount+" accumulators in use")
+		println("\t"+accStore.inUseData+" bins locked in in-use accumulators")
+		println("\t"+accStore.availableCount+" accumulators available")
+		println("\t"+accStore.availableData+" bins size locked in available accumulators")
+
 		results
     }
 
