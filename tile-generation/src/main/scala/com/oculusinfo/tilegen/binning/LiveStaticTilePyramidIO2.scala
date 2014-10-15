@@ -73,6 +73,9 @@ class LiveStaticTilePyramidIO2 (sc: SparkContext) extends PyramidIO {
 	private val metaData = MutableMap[String, PyramidMetaData]()
 	private val accStore = new AccumulatorStore
 
+	// Shared in package only for testing purposes
+	private [binning] def debugAccumulatorStore = accStore
+
 	def initializeForWrite (pyramidId: String): Unit = {
 	}
 
@@ -296,6 +299,20 @@ class AccumulatorStore {
 	private val origin = Thread.currentThread
 	private val inUse = MutableMap[ClassTag[_], MutableSet[TileAccumulableInfo[_]]]()
 	private val available = MutableMap[ClassTag[_], Stack[TileAccumulableInfo[_]]]()
+
+	// debug info - number of accumulators reserved, in use, etc.
+	def inUseCount = inUse.map(_._2.size).fold(0)(_ + _)
+	def availableCount = available.map(_._2.size).fold(0)(_ + _)
+	def totalCount = inUseCount + availableCount
+
+	// debug info - number of bins of data in reserved, in use, etc. accumulators
+	def inUseData =
+		inUse.map(_._2.map(_.accumulable.value.size).fold(0)(_ + _))
+			.fold(0)(_ + _)
+	def availableData =
+		available.map(_._2.map(_.accumulable.value.size).fold(0)(_ + _))
+			.fold(0)(_ + _)
+	def totalData = inUseData + availableData
 
 	def reserve[PT] (sc: SparkContext,
 	                 add: (PT, PT) => PT,
