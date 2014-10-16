@@ -21,7 +21,6 @@ import javax.swing.JButton;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JTextArea;
-import javax.swing.JTextField;
 import javax.swing.WindowConstants;
 
 import org.apache.avro.file.CodecFactory;
@@ -35,10 +34,12 @@ import com.oculusinfo.binning.TileData;
 import com.oculusinfo.binning.TileIndex;
 import com.oculusinfo.binning.io.serialization.TileSerializer;
 import com.oculusinfo.binning.io.serialization.impl.DoubleAvroSerializer;
-import com.oculusinfo.tilegen.binning.LiveStaticTilePyramidIO;
+import com.oculusinfo.binning.util.Pair;
+import com.oculusinfo.tilegen.binning.LiveStaticTilePyramidIO2;
 
 public class JuliaLiveTest extends JFrame {
 	private static final long serialVersionUID = 1L;
+	private static final String ID = "julia";
 
 
 
@@ -52,9 +53,9 @@ public class JuliaLiveTest extends JFrame {
 
 
 
-	private SparkContext            _sc;
-	private LiveStaticTilePyramidIO _pyramidIO;
-	private TileSerializer<Double>  _serializer;
+	private SparkContext             _sc;
+	private LiveStaticTilePyramidIO2 _pyramidIO;
+	private TileSerializer<Double>   _serializer;
 
 
 
@@ -95,8 +96,8 @@ public class JuliaLiveTest extends JFrame {
 		for (String key: JSONObject.getNames(jsonConfig))
 			config.setProperty(key, jsonConfig.getString(key));
 
-		_pyramidIO = new LiveStaticTilePyramidIO(_sc);
-		_pyramidIO.initializeForRead("julia", 256, 256, config);
+		_pyramidIO = new LiveStaticTilePyramidIO2(_sc);
+		_pyramidIO.initializeForRead(ID, 256, 256, config);
 	}
 
 	private void setupTileSerializer () {
@@ -111,42 +112,34 @@ public class JuliaLiveTest extends JFrame {
 
 		JButton doTiling = new JButton("Retrieve tiles");
 
-		final JTextField partitions = new JTextField();
-		partitions.setEditable(true);
-		if (_pyramidIO.getConsolidationPartitions().isDefined()) {
-			partitions.setText(_pyramidIO.getConsolidationPartitions().get().toString());
-		} else {
-			partitions.setText("");
-		}
 		add(tiles,                      new GridBagConstraints(0, 0, 4, 1, 1.0, 1.0, GridBagConstraints.CENTER, GridBagConstraints.BOTH, new Insets(0, 0, 0, 0), 0, 0));
 		add(new JLabel(""),             new GridBagConstraints(0, 1, 1, 1, 1.0, 0.0, GridBagConstraints.EAST, GridBagConstraints.NONE, new Insets(0, 0, 0, 0), 0, 0));
 		add(new JLabel("Partitions: "), new GridBagConstraints(1, 1, 1, 1, 0.0, 0.0, GridBagConstraints.EAST, GridBagConstraints.NONE, new Insets(0, 0, 0, 0), 0, 0));
-		add(partitions,                 new GridBagConstraints(2, 1, 1, 1, 0.5, 0.0, GridBagConstraints.WEST, GridBagConstraints.BOTH, new Insets(0, 0, 0, 0), 0, 0));
 		add(doTiling,                   new GridBagConstraints(3, 1, 1, 1, 0.0, 0.0, GridBagConstraints.EAST, GridBagConstraints.NONE, new Insets(0, 0, 0, 0), 0, 0));
 
 		doTiling.addActionListener(new ActionListener() {
 				@Override
 				public void actionPerformed (ActionEvent event) {
-					Integer conParts = null;
-					try {
-						conParts = Integer.parseInt(partitions.getText().trim());
-					} catch (NumberFormatException e) {}
-					if (null == conParts) {
-						_pyramidIO.eliminateConsolidationPartitions();
-					} else {
-						_pyramidIO.setConsolidationPartitions(conParts);
+					Pair<ArrayList<TileIndex>, Integer> test= parseIndices(tiles.getText().replace("\n", ""));
+					for (int i=0; i<test.getSecond(); ++i) {
+					    testTileRetrieval(test.getFirst());
 					}
-					List<TileIndex> indices = parseIndices(tiles.getText().replace("\n", ""));
-					testTileRetrieval(indices);
 				}
 			});
 	}
 
-	private List<TileIndex> parseIndices (String text) {
-		List<TileIndex> tileList = new ArrayList<>();
+	private Pair<ArrayList<TileIndex>, Integer> parseIndices (String text) {
+		ArrayList<TileIndex> tileList = new ArrayList<>();
 
 		// Parse tile list
-		for (String part: text.split(";")) {
+		String[] parts = text.split("x");
+		int repetitions = 1;
+		String tiles = text;
+		if (2 == parts.length) {
+		    repetitions = Integer.parseInt(parts[0].trim());
+		    tiles = parts[1];
+		}
+		for (String part: tiles.split(";")) {
 			String[] subParts = part.split(",");
 			if (3 <= subParts.length) {
 				List<Integer> xs = parseIndex(subParts[0].trim());
@@ -158,7 +151,7 @@ public class JuliaLiveTest extends JFrame {
 							tileList.add(new TileIndex(z, x, y));
 			}
 		}
-		return tileList;
+		return new Pair<ArrayList<TileIndex>, Integer>(tileList, repetitions);
 	}
 
 	private List<Integer> parseIndex (String index) {
@@ -192,7 +185,7 @@ public class JuliaLiveTest extends JFrame {
 		System.gc();
 		System.gc();
 		long startTime = System.currentTimeMillis();
-		List<TileData<Double>> tiles = _pyramidIO.readTiles("julia", _serializer, indices);
+		List<TileData<Double>> tiles = _pyramidIO.readTiles(ID, _serializer, indices);
 		long endTime = System.currentTimeMillis();
 		Set<TileIndex> input = new HashSet<>(indices);
 		Set<TileIndex> output = new HashSet<>();
