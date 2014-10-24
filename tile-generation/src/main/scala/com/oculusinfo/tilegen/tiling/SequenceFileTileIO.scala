@@ -32,6 +32,7 @@ import java.io.ByteArrayOutputStream
 import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
@@ -286,10 +287,18 @@ object SequenceFileTileIO {
 		blocks.toList
 	}
 
+	def getBlocks (source: File): List[File] = {
+		source.listFiles(new java.io.FileFilter() {
+			                 def accept (pathname: File): Boolean = {
+				                 pathname.exists && pathname.isDirectory && pathname.getName.matches("[0-9]+")
+			                 }
+		                 }).toList
+	}
+
 	def getMetaDataPath (location: Path) =
 		new Path(location, "metadata")
 
-	def localizeFiles[T] (hdfsLoc: String, fsLoc: String, serializer: TileSerializer[T]): Unit = {
+	def localizeHDFSSequenceFiles[T] (hdfsLoc: String, fsLoc: String, serializer: TileSerializer[T]): Unit = {
 		// Make sure our source location exists
 		val fs = getFS(hdfsLoc)
 		val hdfsBase = new Path(hdfsLoc)
@@ -331,7 +340,56 @@ object SequenceFileTileIO {
 				}
 			}
 		)
+	}
 
+	def localizeLocalSequenceFiles[T] (sourceName: String, destName: String, serializer: TileSerializer[T]): Unit = {
+		// Make sure our source location exists
+		val source = new File(sourceName)
+		if (!source.exists) throw new IllegalArgumentException("Nonexistent source location "+source)
+		if (!source.isDirectory) throw new IllegalArgumentException("Source location "+source+" is not a directory")
+
+		// Set up our local io
+		val fsio = new FileSystemPyramidIO(null, "avro")
+		fsio.initializeForWrite(destName)
+
+		// Copy over metadata
+		val metaDataSource = new File(source, "metaData")
+		if (metaDataSource.exists) {
+			val reader = new BufferedReader(new InputStreamReader(new FileInputStream(metaDataSource)))
+			val metaData = Stream.continually(reader.readLine()).takeWhile(_ != null).mkString("\n")
+			fsio.writeMetaData(destName, metaData)
+			reader.close
+		}
+
+		val conf = new Configuration
+
+		// Write blocks over, one by one
+		getBlocks(source).foreach(block =>
+			{
+				println("Looking at block "+block)
+				block.listFiles.filter(file =>
+					file.exists && file.isFile && "_SUCCESS" != file.getName
+				).foreach(file =>
+					{
+						val reader = new SequenceFile.Reader(conf, SequenceFile.Reader.file(new Path(file.toURI)))
+						val key = new Text
+						val value = new BytesWritable
+						var n = 0
+                        print("\tUnpacking "+file.getName+".\tStart: "+(new java.util.Date))
+						while (reader.next(key, value)) {
+							val index = TileIndex.fromString(key.toString)
+							val bais = new ByteArrayInputStream(value.getBytes)
+							val tile = serializer.deserialize(index, bais)
+							fsio.writeTiles(destName, serializer, List(tile).asJava)
+							n = n+1
+						}
+						reader.close
+						println("\tDone: "+(new java.util.Date)+"\ttiles: "+n)
+					}
+				)
+				println
+			}
+		)
 	}
 }
 
@@ -348,7 +406,10 @@ object LocalizeTileSet {
 				                                      "localizer is run")
 			val serializer = TileSerializerChooser.fromArguments(argParser)
 
-			SequenceFileTileIO.localizeFiles(source, destination, serializer)
+			if (source.toLowerCase.startsWith("hdfs"))
+				SequenceFileTileIO.localizeHDFSSequenceFiles(source, destination, serializer)
+			else 
+				SequenceFileTileIO.localizeLocalSequenceFiles(source, destination, serializer)
 		} catch {
 			case e: MissingArgumentException => {
 				println("LocalizeTileSet - pull a sequence-file-based tile set from HBase into a local ")
