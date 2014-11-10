@@ -69,8 +69,13 @@ public class JuliaLiveTest extends JFrame {
 
 	private void setupSparkContext () {
 		SparkConf conf = new SparkConf();
-		conf.setMaster("local[1]");
+		conf.setMaster("spark://hadoop-s1.oculus.local:7077");
 		conf.setAppName("Julia live tile testing");
+		conf.setSparkHome("/opt/spark");
+		conf.setJars(new String[] {
+		   "target/tile-generation-0.4-SNAPSHOT.jar",
+		   "../binning-utilities/target/binning-utilities-0.4-SNAPSHOT.jar"                        
+		});
 		JavaSparkContext jsc = new JavaSparkContext(conf);
 		_sc = JavaSparkContext.toSparkContext(jsc);
 		_sc.cancelAllJobs();
