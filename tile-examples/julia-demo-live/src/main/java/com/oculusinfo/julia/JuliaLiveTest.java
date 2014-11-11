@@ -53,6 +53,7 @@ public class JuliaLiveTest extends JFrame {
 
 
 
+	private JSONObject               _config;
 	private SparkContext             _sc;
 	private LiveStaticTilePyramidIO2 _pyramidIO;
 	private TileSerializer<Double>   _serializer;
@@ -60,6 +61,8 @@ public class JuliaLiveTest extends JFrame {
 
 
 	public JuliaLiveTest () throws IOException, JSONException {
+	    setupConfiguration();
+
 		setupSparkContext();
 		setupPyramidIO();
 		setupTileSerializer();
@@ -67,7 +70,24 @@ public class JuliaLiveTest extends JFrame {
 		setupUI();
 	}
 
-	private void setupSparkContext () {
+	private void setupConfiguration () throws IOException, JSONException {
+        String rawConfig = "";
+        String line;
+        InputStream configStream = JuliaLiveTest.class.getResourceAsStream("/layers/julia-layer.json");
+        BufferedReader configReader = new BufferedReader(new InputStreamReader(configStream));
+        while (null != (line = configReader.readLine()))
+            rawConfig += line;
+        configReader.close();
+
+        _config = new JSONObject(rawConfig)
+            .getJSONArray("layers")
+            .getJSONObject(0)
+            .getJSONObject("data")
+            .getJSONObject("pyramidio")
+            .getJSONObject("data");
+	}
+
+	private void setupSparkContext () throws JSONException {
 		SparkConf conf = new SparkConf();
 		conf.setMaster("spark://hadoop-s1.oculus.local:7077");
 		conf.setAppName("Julia live tile testing");
@@ -76,30 +96,22 @@ public class JuliaLiveTest extends JFrame {
 		   "target/tile-generation-0.4-SNAPSHOT.jar",
 		   "../binning-utilities/target/binning-utilities-0.4-SNAPSHOT.jar"                        
 		});
+
+		for (String key: JSONObject.getNames(_config)) {
+		    if (key.startsWith("spark")) {
+		        conf.set(key, _config.getString(key));
+		    }
+		}
+
 		JavaSparkContext jsc = new JavaSparkContext(conf);
 		_sc = JavaSparkContext.toSparkContext(jsc);
 		_sc.cancelAllJobs();
 	}
 
 	private void setupPyramidIO () throws IOException, JSONException {
-		String rawConfig = "";
-		String line;
-		InputStream configStream = JuliaLiveTest.class.getResourceAsStream("/layers/julia-layer.json");
-		BufferedReader configReader = new BufferedReader(new InputStreamReader(configStream));
-		while (null != (line = configReader.readLine()))
-			rawConfig += line;
-		configReader.close();
-
-		JSONObject jsonConfig = new JSONObject(rawConfig)
-			.getJSONArray("layers")
-			.getJSONObject(0)
-			.getJSONObject("data")
-			.getJSONObject("pyramidio")
-			.getJSONObject("data");
-
 		Properties config = new Properties();
-		for (String key: JSONObject.getNames(jsonConfig))
-			config.setProperty(key, jsonConfig.getString(key));
+		for (String key: JSONObject.getNames(_config))
+			config.setProperty(key, _config.getString(key));
 
 		_pyramidIO = new LiveStaticTilePyramidIO2(_sc);
 		_pyramidIO.initializeForRead(ID, 256, 256, config);
