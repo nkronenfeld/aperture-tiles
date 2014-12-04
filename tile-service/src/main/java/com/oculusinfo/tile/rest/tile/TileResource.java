@@ -129,6 +129,12 @@ public class TileResource extends ApertureServerResource {
                         }
                     }
                 }
+
+                System.out.println(String.format("Translating general area tileset request of [%d to %d, %d to %d, %d to %d]", minX, maxX, minY, maxY, minZ, maxZ));
+                System.out.print("\tTranslation ["+indices.size()+" tiles] is:");
+                for (TileIndex index: indices) System.out.print(index+", ");
+                System.out.println();
+                System.out.println("\tTranslated to: "+TileBounds.combineIndices(indices));
             }
 
         } catch ( Exception e ) {
@@ -167,6 +173,7 @@ public class TileResource extends ApertureServerResource {
 
             // parse parameters for tile sets or tile bounds
 			Collection<TileIndex> tileSet = parseTileSetDescription( decodedQueryParams );
+			System.out.println("Requesting specific tile "+index);
 			tileSet.add(index);
 
 			if (null == extType) {

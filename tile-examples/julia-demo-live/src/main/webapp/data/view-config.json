@@ -2,8 +2,7 @@
 	{
 		"name": "Julia Set",
 		"layers": [
-			"live-julia-layer",
-			"static-julia-layer"
+			"live-julia-layer"
 		],
 		"map": "julia-map"
 	}

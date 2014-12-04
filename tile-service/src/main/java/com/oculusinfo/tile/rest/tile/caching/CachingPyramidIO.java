@@ -42,6 +42,7 @@ import com.oculusinfo.binning.io.PyramidIO;
 import com.oculusinfo.binning.io.serialization.TileSerializer;
 import com.oculusinfo.factory.ConfigurableFactory;
 import com.oculusinfo.factory.ConfigurationException;
+import com.oculusinfo.tile.rest.tile.TileBounds;
 import com.oculusinfo.tile.rest.tile.caching.TileCacheEntry.CacheRequestCallback;
 
 public class CachingPyramidIO implements PyramidIO {
@@ -163,12 +164,19 @@ public class CachingPyramidIO implements PyramidIO {
 	                              Iterable<TileIndex> indices) throws IOException {
 		TileCache<T> cache = getTileCache(pyramidId);
 
+		List<TileIndex> foo = new ArrayList<>();
+		for (TileIndex bar: indices) foo.add(bar);
+		System.out.println("Requesting "+foo.size()+" tiles");
 		synchronized (cache) {
 			// First, request and retrieve all tiles needed over the long term
 			// Only request those we don't already have
 			List<TileIndex> newIndices = new ArrayList<>(cache.getNewRequests(indices));
-			if (newIndices.isEmpty())
+			if (newIndices.isEmpty()) {
+			    System.out.println("\tNo new tiles");
 				return;
+			} else {
+			    System.out.println("\t"+newIndices.size()+" new tiles: " + TileBounds.combineIndices(newIndices));
+			}
 
 			PyramidIO base = getBasePyramidIO(pyramidId);
 			List<TileData<T>> tiles = base.readTiles(pyramidId, serializer, newIndices);
@@ -178,6 +186,7 @@ public class CachingPyramidIO implements PyramidIO {
 				cache.provideTile(tile);
 				newIndices.remove(tile.getDefinition());
 			}
+			System.out.println("\tReceived "+tiles.size()+" tiles: "+TileBounds.combineTiles(tiles)+", didn't receive "+newIndices.size());
 			// And the fact that some were empty
 			for (TileIndex index: newIndices) {
 				cache.provideEmptyTile(index);

@@ -77,15 +77,15 @@ define(function (require) {
          * function when they are received.
          */
         requestLayers: function( callback ) {
-            aperture.io.rest('/v1.0/layer',
+            aperture.io.rest('/v1.0/layers',
                              'GET',
-                             function (layers, status) {
+                             function (results, status) {
                                  var layerMap = {},
                                     i;
                                  if (status.success) {
-                                     for ( i=0; i<layers.length; i++ ) {
-                                         layers[i].meta.minMax = parseLevelsMinMax( layers[i].meta );
-                                         layerMap[ layers[i].id ] = layers[i];
+                                     for ( i=0; i<results.layers.length; i++ ) {
+                                         results.layers[i].meta.minMax = parseLevelsMinMax( results.layers[i].meta );
+                                         layerMap[ results.layers[i].id ] = results.layers[i];
                                      }
                                  }
                                  callback( layerMap );
@@ -98,7 +98,7 @@ define(function (require) {
          * function when it is received.
          */
         requestLayer: function( layerId, callback ) {
-            aperture.io.rest('/v1.0/layer/' + layerId,
+            aperture.io.rest('/v1.0/layers/' + layerId,
                              'GET',
                              function (layer, status) {
                                  if (status.success) {
@@ -113,7 +113,7 @@ define(function (require) {
          */
         configureLayer: function( layerId, params, callback ) {
 
-            aperture.io.rest('/v1.0/layer/' + layerId,
+            aperture.io.rest('/v1.0/layers/' + layerId,
                              'POST',
                              function( response, statusInfo ) {
                                 callback( response.sha );
