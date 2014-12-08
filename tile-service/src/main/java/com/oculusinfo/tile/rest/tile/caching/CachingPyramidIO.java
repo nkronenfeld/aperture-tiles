@@ -28,10 +28,12 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Stack;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -43,19 +45,24 @@ import com.oculusinfo.binning.io.serialization.TileSerializer;
 import com.oculusinfo.factory.ConfigurableFactory;
 import com.oculusinfo.factory.ConfigurationException;
 import com.oculusinfo.tile.rest.tile.TileBounds;
-import com.oculusinfo.tile.rest.tile.caching.TileCacheEntry.CacheRequestCallback;
 
 public class CachingPyramidIO implements PyramidIO {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CachingPyramidIO.class);
 
-	private Map<String, TileCache<?>>                    _tileCaches;
-	private Map<String, PyramidIO>                       _basePyramidIOs;
-	private List<LayerDataChangedListener>               _layerListeners;
+	private Map<String, LayerInfo<?>>                         _layers;
+	private List<LayerDataChangedListener>                    _layerListeners;
+	private Thread                                            _requestThread;
+	private Stack<String>                                     _mruIDs;
+
+
 
 	public CachingPyramidIO () {
-		_tileCaches = new HashMap<>();
-		_basePyramidIOs = new HashMap<>();
+		_layers = new HashMap<>();
 		_layerListeners = new ArrayList<>();
+		_mruIDs = new Stack<>();
+		_requestThread = new Thread(new TileRequestRunner(), "Tile Request Thread");
+		_requestThread.setDaemon(true);
+		_requestThread.start();
 	}
 
 	public void addLayerListener (LayerDataChangedListener listener) {
@@ -66,20 +73,25 @@ public class CachingPyramidIO implements PyramidIO {
 		_layerListeners.remove(listener);
 	}
 
-	synchronized private PyramidIO getBasePyramidIO (String pyramidId) {
-		return _basePyramidIOs.get(pyramidId);
-	}
-
-	synchronized private <T> TileCache<T> getTileCache (String pyramidId) {
-		// We rely on configuration to make sure types match here
+	synchronized private <T> RequestCache<TileIndex, TileData<T>> getTileCache (String pyramidId, TileSerializer<T> serializer) {
+		// We rely on configuration to make sure types match here.
 		@SuppressWarnings({"rawtypes", "unchecked"})
-		TileCache<T> cache = (TileCache)_tileCaches.get(pyramidId);
-		if (null == cache) {
-			cache = new TileCache<>(10000, 100);
-			cache.addGlobalCallback(new GlobalCallback<T>(pyramidId));
-			_tileCaches.put(pyramidId, cache);
+		LayerInfo<T> info = (LayerInfo) _layers.get(pyramidId);
+
+		if (null == info) {
+			info = new LayerInfo<>();
+			_layers.put(pyramidId, info);
 		}
-		return cache;
+
+		if (null != serializer)
+			info._serializer = serializer;
+
+		if (null == info._tileCache) {
+			info._tileCache = new RequestCache<TileIndex, TileData<T>>(10000, 100);
+			info._tileCache.addGlobalCallback(new GlobalCallback(pyramidId));
+		}
+
+		return info._tileCache;
 	}
 
 	// Using the callback mechanism in the tile cache, get a tile and hand it
@@ -88,10 +100,9 @@ public class CachingPyramidIO implements PyramidIO {
 	// This does _not_ handle making the request; that must be done separately
 	// with RequestData.
 	private <T> TileData<T> getTileData (String pyramidId, TileIndex index) {
-		TileCache<T> cache = getTileCache(pyramidId);
-
+		RequestCache<TileIndex, TileData<T>> cache = getTileCache(pyramidId, null);
 		CacheListenerCallback<T> callback = new CacheListenerCallback<>();
-		cache.requestTile(index, callback);
+		cache.request(index, callback);
 
 		TileData<T> tile = callback.waitForTile();
 
@@ -124,14 +135,16 @@ public class CachingPyramidIO implements PyramidIO {
 	 * Set up a base pyramid from which to read when we get a cache miss
 	 */
 	public void setupBasePyramidIO (String pyramidId, ConfigurableFactory<PyramidIO> factory) {
-		if (!_basePyramidIOs.containsKey(pyramidId)) {
-			synchronized (_basePyramidIOs) {
-				if (!_basePyramidIOs.containsKey(pyramidId)) {
+		if (!_layers.containsKey(pyramidId) || null == _layers.get(pyramidId)._basePyramidIO) {
+			synchronized (_layers) {
+				if (!_layerListeners.contains(pyramidId)) {
+					_layers.put(pyramidId, new LayerInfo<>());
+				}
+				if (null == _layers.get(pyramidId)._basePyramidIO) {
 					try {
-						PyramidIO basePyramidIO = factory.produce(PyramidIO.class);
-						_basePyramidIOs.put(pyramidId, basePyramidIO);
+						_layers.get(pyramidId)._basePyramidIO = factory.produce(PyramidIO.class);
 					} catch (ConfigurationException e) {
-						LOGGER.warn("Error creating base pyramid IO", e);
+						LOGGER.warn("Error creating base pyramid IO for pyramid "+pyramidId, e);
 					}
 				}
 			}
@@ -142,10 +155,10 @@ public class CachingPyramidIO implements PyramidIO {
 	@Override
 	public void initializeForRead (String pyramidId, int width, int height,
 	                               Properties dataDescription) {
-		if (!_basePyramidIOs.containsKey(pyramidId)) {
+		if (!_layers.containsKey(pyramidId) || null == _layers.get(pyramidId)._basePyramidIO) {
 			LOGGER.info("Attempt to initialize unknown pyramid" + pyramidId + "'.");
 		} else {
-			_basePyramidIOs.get(pyramidId).initializeForRead(pyramidId, width, height, dataDescription);
+			_layers.get(pyramidId)._basePyramidIO.initializeForRead(pyramidId, width, height, dataDescription);
 		}
 	}
 
@@ -162,35 +175,16 @@ public class CachingPyramidIO implements PyramidIO {
 	public <T> void requestTiles (String pyramidId,
 	                              TileSerializer<T> serializer,
 	                              Iterable<TileIndex> indices) throws IOException {
-		TileCache<T> cache = getTileCache(pyramidId);
+		RequestCache<TileIndex, TileData<T>> cache = getTileCache(pyramidId, serializer);
 
-		List<TileIndex> foo = new ArrayList<>();
-		for (TileIndex bar: indices) foo.add(bar);
-		System.out.println("Requesting "+foo.size()+" tiles");
-		synchronized (cache) {
-			// First, request and retrieve all tiles needed over the long term
-			// Only request those we don't already have
-			List<TileIndex> newIndices = new ArrayList<>(cache.getNewRequests(indices));
-			if (newIndices.isEmpty()) {
-			    System.out.println("\tNo new tiles");
-				return;
-			} else {
-			    System.out.println("\t"+newIndices.size()+" new tiles: " + TileBounds.combineIndices(newIndices));
-			}
+		// Actually reqeust tiles from our cache
+		for (TileIndex index: indices) cache.request(index, null);
 
-			PyramidIO base = getBasePyramidIO(pyramidId);
-			List<TileData<T>> tiles = base.readTiles(pyramidId, serializer, newIndices);
-    
-			// Cache recieved tiles...
-			for (TileData<T> tile: tiles) {
-				cache.provideTile(tile);
-				newIndices.remove(tile.getDefinition());
-			}
-			System.out.println("\tReceived "+tiles.size()+" tiles: "+TileBounds.combineTiles(tiles)+", didn't receive "+newIndices.size());
-			// And the fact that some were empty
-			for (TileIndex index: newIndices) {
-				cache.provideEmptyTile(index);
-			}
+		// Update the list of most recently used pyramids, so we can update them first.
+		synchronized (_mruIDs) {
+			// Move this id to the head of the list.
+			_mruIDs.remove(pyramidId);
+			_mruIDs.push(pyramidId);
 		}
 	}
 
@@ -198,20 +192,17 @@ public class CachingPyramidIO implements PyramidIO {
 	public <T> List<TileData<T>> readTiles (String pyramidId,
 	                                        TileSerializer<T> serializer,
 	                                        Iterable<TileIndex> indices) throws IOException {
-		TileCache<T> cache = getTileCache(pyramidId);
-		synchronized (cache) {
-			List<TileData<T>> tiles = new ArrayList<>();
-			for (TileIndex index: indices) {
-				// We rely on configuration to make sure types match here
-				@SuppressWarnings({"unchecked", "rawtypes"})
-				TileData<T> tile = (TileData) getTileData(pyramidId, index);
+		List<TileData<T>> tiles = new ArrayList<>();
+		for (TileIndex index: indices) {
+			// We rely on configuration to make sure types match here
+			@SuppressWarnings({"unchecked", "rawtypes"})
+			TileData<T> tile = (TileData) getTileData(pyramidId, index);
 
-				if (null != tile)
-					tiles.add(tile);
-			}
-    
-			return(tiles);
+			if (null != tile)
+				tiles.add(tile);
 		}
+    
+		return(tiles);
 	}
 
 	@Override
@@ -235,7 +226,9 @@ public class CachingPyramidIO implements PyramidIO {
 
 	@Override
 	public String readMetaData (String pyramidId) throws IOException {
-		return getBasePyramidIO(pyramidId).readMetaData(pyramidId);
+		if (_layers.containsKey(pyramidId) && null != _layers.get(pyramidId)._basePyramidIO)
+			return _layers.get(pyramidId)._basePyramidIO.readMetaData(pyramidId);
+		return "";
 	}
 
 	@Override
@@ -243,10 +236,10 @@ public class CachingPyramidIO implements PyramidIO {
 		throw new IOException("removeTiles not currently supported for CachingPyramidIO");
 	}
 
-	private class CacheListenerCallback<T> implements CacheRequestCallback<T> {
+	private class CacheListenerCallback<T> implements RequestCache.RequestCallback<TileIndex, TileData<T>> {
 		private TileData<T> _tile;
-		private boolean     _waiting;
-		private boolean     _notified;
+		private boolean _waiting;
+		private boolean _notified;
 
 
 
@@ -260,7 +253,7 @@ public class CachingPyramidIO implements PyramidIO {
 				if (!_notified)
 					try {
 						_waiting = true;
-						wait(1000);
+						wait();
 					} catch (InterruptedException e) {
 						LOGGER.warn("Error waiting for return for tile.", e);
 						return null;
@@ -272,39 +265,90 @@ public class CachingPyramidIO implements PyramidIO {
 			}
 
 		@Override
-		synchronized public boolean onTileReceived (TileIndex index, TileData<T> tile) {
-				_tile = tile;
-				_notified = true;
-				if (_waiting)
-					this.notify();
-				return true;
-			}
-
-		@Override
-		public void onTileAbandoned (TileIndex index) {
+		public boolean onRequestFulfilled (TileIndex key, TileData<T> value) {
+			_tile = value;
+			_notified = true;
 			if (_waiting)
 				this.notify();
+			return true;
 		}
 	}
 
-	private class GlobalCallback<T> implements TileCacheEntry.CacheRequestCallback<T> {
+	private class GlobalCallback implements RequestCache.GlobalRequestCallback {
 		private String _layer;
 		GlobalCallback (String layer) {
 			_layer = layer;
 		}
+
 		@Override
-		public boolean onTileReceived (TileIndex index, TileData<T> tile) {
+		public void onRequestsFulfilled () {
 			for (LayerDataChangedListener listener: _layerListeners) {
 				listener.onLayerDataChanged(_layer);
 			}
-			return false;
-		}
-
-		@Override
-		public void onTileAbandoned (TileIndex index) {
 		}
 	}
 	public interface LayerDataChangedListener {
 		public void onLayerDataChanged (String layer);
+	}
+
+
+
+	private class TileRequestRunner implements Runnable {
+		private <T> void requestTiles (String pyramidId,
+		                               LayerInfo<T> info,
+		                               Collection<TileIndex> indices) throws IOException {
+			PyramidIO base = info._basePyramidIO;
+			RequestCache<TileIndex, TileData<T>> cache = info._tileCache;
+			TileSerializer<T> serializer = info._serializer;
+
+			List<TileData<T>> tiles = base.readTiles(pyramidId, serializer, indices);
+
+			// New way
+			Map<TileIndex, TileData<T>> results = new HashMap<>();
+			for (TileData<T> tile: tiles) {
+				results.put(tile.getDefinition(), tile);
+				indices.remove(tile.getDefinition());
+			}
+			for (TileIndex index: indices) {
+				results.put(index, null);
+			}
+			cache.provide(results);
+		}
+
+		@Override
+		public void run () {
+			while (true) {
+				while (!_mruIDs.isEmpty()) {
+					String id = null;
+					try {
+						synchronized (_mruIDs) {
+							id = _mruIDs.pop();
+						}
+
+						Collection<TileIndex> pending = null;
+						LayerInfo<?> info = _layers.get(id);
+						if (null != info && null != info._tileCache)
+							pending = info._tileCache.reserveKeys(0);
+						if (!pending.isEmpty()) {
+							// Actually request tiles
+							requestTiles(id, info, pending);
+						}
+					} catch (Throwable t) {
+						LOGGER.warn("Error retreiving tiles for pyramid "+id, t);
+					}
+				}
+				// And pause briefly before trying again.
+				try {
+					this.wait(250);
+				} catch (Throwable t) {
+				}
+			}
+		}
+	}
+
+	private class LayerInfo<T> {
+		RequestCache<TileIndex, TileData<T>> _tileCache;
+		PyramidIO                            _basePyramidIO;
+		TileSerializer<T>                    _serializer;
 	}
 }
