@@ -24,15 +24,20 @@
 package com.oculusinfo.tile.rest.tile.caching;
 
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.TreeSet;
+
 import com.oculusinfo.binning.TileData;
 import com.oculusinfo.binning.TileIndex;
 import com.oculusinfo.binning.util.LRUCache.RemovalPolicy;
 import com.oculusinfo.binning.util.Pair;
 import com.oculusinfo.binning.util.SynchronizedLRUCache;
 import com.oculusinfo.tile.rest.tile.caching.TileCacheEntry.CacheRequestCallback;
-
-import java.util.*;
-import java.util.Map.Entry;
 
 
 
@@ -44,19 +49,22 @@ import java.util.Map.Entry;
  * 
  */
 public class TileCache<T> {
-	// The maximum amount of time an unrecieved tile is guaranteed to remain in
-	// the cache, in milliseconds
-	private long                                                    _maxTileAge;
-	// The cache iteself
-	private SynchronizedLRUCache<TileIndex, TileCacheEntry<T>> _cache;
-	// A list of all keys which have recieved their data, with the time at which they were first requested.
-	private TreeSet<Pair<TileIndex, Long>>                          _haveData;
-	// A list of all keys, in the order in which they were requested.
-	private List<TileIndex>                                         _orderedKeys;
-	// A listener to attach to all entries
-	private CacheEntryListener                                      _entryListener;
-	// A list of global listeners to all requests
-	private List<CacheRequestCallback<T>>                           _globalCallbacks;
+    // The maximum amount of time an unrecieved tile is guaranteed to remain in
+    // the cache, in milliseconds
+    private long                                               _maxTileAge;
+    // The cache iteself
+    private SynchronizedLRUCache<TileIndex, TileCacheEntry<T>> _cache;
+    // A list of all keys which have recieved their data, with the time at which
+    // they were first requested.
+    private TreeSet<Pair<TileIndex, Long>>                     _haveData;
+    // A list of all keys, in the order in which they were requested.
+    private List<TileIndex>                                    _orderedKeys;
+    // A listener to attach to all entries
+    private CacheEntryListener                                 _entryListener;
+    // A list of global listeners to all requests
+    private List<CacheRequestCallback<T>>                      _globalCallbacks;
+
+
 
 	public TileCache (long maxAge, int maxSize) {
 		_maxTileAge = maxAge;
@@ -82,6 +90,8 @@ public class TileCache<T> {
 	 * 
 	 * Each new request will be placed in the cache.
 	 * 
+	 * These returned requests will not be marked as reserved.
+	 * 
 	 * @param requests
 	 *            The list of tiles needed
 	 * @return A sublist of just those tiles not already requested
@@ -106,6 +116,23 @@ public class TileCache<T> {
 		}
 
 		return needed;
+	}
+
+    /**
+     * Gather all pending requests that have not been reserved, reserve them,
+     * and return the list of them.
+     */
+	public List<TileIndex> reservePendingRequests () {
+	    synchronized (_cache) {
+	        List<TileIndex> reserved = new ArrayList<>();
+	        for (TileCacheEntry<?> entry: _cache.values()) {
+	            if (!entry.hasBeenReceived() && !entry.hasBeenReserved()) {
+	                if (entry.reserve())
+	                    reserved.add(entry.getIndex());
+	            }
+	        }
+	        return reserved;
+	    }
 	}
 
 	/**

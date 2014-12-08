@@ -47,10 +47,12 @@ public class TileCacheEntry<T> {
 	private TileData<T>                   _tile;
 	/* The time of our original request */
 	private long                          _requestTime;
-	/* True only if the data for this tile has been recieved */
+	/* True only if the data for this tile has been received */
 	private boolean                       _received;
 	/* True only if this tile has ever actually been retrieved */
 	private boolean                       _retreived;
+	/* True only if this request has been explicitly reserved for fulfillment */
+    private boolean                       _reserved;
 	/* A list of listeners for tile requests */
 	private List<CacheRequestCallback<T>> _requests;
 
@@ -60,6 +62,7 @@ public class TileCacheEntry<T> {
 		_requestTime = System.currentTimeMillis();
 		_received = false;
 		_retreived = false;
+		_reserved = false;
 		_requests = new ArrayList<>();
 	}
 
@@ -108,10 +111,45 @@ public class TileCacheEntry<T> {
 	}
 
 	/**
-	 * Indicates whether or not the requested tile has yet been received
+	 * Get the index of the tile described by this cache entry
+	 */
+	public TileIndex getIndex () {
+	    return _index;
+	}
+
+	/**
+	 * Indicates if the requested tile has been received.
+	 * @return
+	 */
+	public boolean hasBeenReceived () {
+	    return _received;
+	}
+
+	/**
+	 * Indicates whether or not the requested tile has yet been retrieved
 	 */
 	public boolean hasBeenRetrieved () {
 		return _retreived;
+	}
+
+	/**
+     * Indicates whether or not something has reserved the requested tile for
+     * retreival.
+     */
+	synchronized public boolean hasBeenReserved () {
+	    return _reserved;
+	}
+
+	/**
+     * Reserve the requested tile for retreival.
+     * 
+     * @return true if the tile was properly reserved, false if it has already
+     *         been reserved.
+     */
+	synchronized public boolean reserve () {
+	    if (_reserved) return false;
+	    _reserved = true;
+	    return true;
 	}
 
 	/**
@@ -130,6 +168,17 @@ public class TileCacheEntry<T> {
 		return System.currentTimeMillis()-_requestTime;
 	}
 
+	@Override
+	public String toString () {
+	    return String.format("Tile cache entry for %s (age: %.2fs, %s, %s, %s, %s, %d requests)",
+	                         _index.toString(),
+	                         (System.currentTimeMillis()-_requestTime)/1000.0,
+	                         (null == _tile ? "empty" : "filled"),
+	                         (_received ? "received" : "waiting"),
+	                         (_retreived ? "retreived" : "waiting"),
+	                         (_reserved ? "reserved" : "pending"),
+	                         _requests.size());
+	}
 
 
 	/**
@@ -145,7 +194,7 @@ public class TileCacheEntry<T> {
 		 *         from the repository (and this callback won't be called
 		 *         again). False if it was not so processed (in which case this
 		 *         callback may be called again, if, for instance, the tile is
-		 *         recieved a second time) If false, some other callback may
+		 *         received a second time) If false, some other callback may
 		 *         still process it, in which case it may still be deleted.
 		 */
 		public boolean onTileReceived (TileIndex index, TileData<T> tile);

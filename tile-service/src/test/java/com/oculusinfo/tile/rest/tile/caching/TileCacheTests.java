@@ -68,6 +68,7 @@ public class TileCacheTests {
 
 
 
+	// Submit a request for a new tile, checking if it is an old or new request.
 	private void checkRequest (TileIndex index, boolean expectedNewRequest) {
 		List<TileIndex> newRequests = _cache.getNewRequests(Collections.singletonList(index));
 		if (expectedNewRequest) {
@@ -174,6 +175,37 @@ public class TileCacheTests {
 		}
 		checkRequest(_indices[0], true);
 	}
+
+	// Test that a series of requests are combined into one
+	@Test
+	public void testRequestConsolidation () throws InterruptedException {
+        checkRequest(_indices[0], true);
+        checkRequest(_indices[1], true);
+        checkRequest(_indices[2], true);
+        checkRequest(_indices[3], true);
+
+        _cache.provideTile(new TileData<Integer>(_indices[0], 0));
+        List<TileIndex> pending = _cache.reservePendingRequests();
+        Assert.assertEquals(3, pending.size());
+        Assert.assertTrue(pending.contains(_indices[1]));
+        Assert.assertTrue(pending.contains(_indices[2]));
+        Assert.assertTrue(pending.contains(_indices[3]));
+
+        pending = _cache.reservePendingRequests();
+        Assert.assertEquals(0, pending.size());
+
+        checkRequest(_indices[0], false);
+        checkRequest(_indices[5], true);
+        checkRequest(_indices[6], true);
+        checkRequest(_indices[7], true);
+        _cache.provideEmptyTile(_indices[5]);
+
+        pending = _cache.reservePendingRequests();
+        Assert.assertEquals(2, pending.size());
+        Assert.assertTrue(pending.contains(_indices[6]));
+        Assert.assertTrue(pending.contains(_indices[7]));
+	}
+
 
 
 
